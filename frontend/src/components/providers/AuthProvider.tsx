@@ -1,7 +1,7 @@
 "use client";
 
 import { ClerkProvider } from "@clerk/nextjs";
-import { useEffect, type ReactNode } from "react";
+import { useEffect, useState, type ReactNode } from "react";
 
 import { isLikelyValidClerkPublishableKey } from "@/auth/clerkKey";
 import {
@@ -16,6 +16,12 @@ import {
   redirectToOidcLogin,
 } from "@/auth/oidcAuth";
 import { LocalAuthLogin } from "@/components/organisms/LocalAuthLogin";
+
+/** Returns true when the browser is on the OIDC callback page. */
+function isOidcCallbackPath(): boolean {
+  if (typeof window === "undefined") return false;
+  return window.location.pathname === "/auth/callback";
+}
 
 export function AuthProvider({ children }: { children: ReactNode }) {
   const localMode = isLocalAuthMode();
@@ -40,7 +46,9 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
   // --- OIDC auth: redirect to provider if no session token ---
   if (oidcMode) {
-    if (!getOidcToken()) {
+    // Allow the /auth/callback page to render without a token — it
+    // performs the one-time exchange that *creates* the token.
+    if (!getOidcToken() && !isOidcCallbackPath()) {
       // Not yet authenticated — redirect to OIDC login.
       // We do this in an effect to avoid hydration mismatches.
       return <OidcRedirect />;

@@ -22,7 +22,7 @@ from typing import Any
 
 import httpx
 import jwt as pyjwt
-from jwt import PyJWKClient
+from jwt import PyJWK
 
 from app.core.config import settings
 from app.core.logging import get_logger
@@ -80,20 +80,72 @@ async def get_userinfo_endpoint() -> str:
 
 
 # ---------------------------------------------------------------------------
-# JWKS client (cached by PyJWKClient internally)
+# JWKS fetching (via httpx, cached)
 # ---------------------------------------------------------------------------
 
-_jwk_client: PyJWKClient | None = None
+_jwks_cache: dict[str, Any] | None = None
+_jwks_ts: float = 0.0
+_JWKS_TTL = 3600  # re-fetch once per hour
 
 
-async def _get_jwk_client() -> PyJWKClient:
-    """Return a PyJWKClient pointed at the provider's JWKS URI."""
-    global _jwk_client  # noqa: PLW0603
-    if _jwk_client is not None:
-        return _jwk_client
+async def _fetch_jwks() -> dict[str, Any]:
+    """Fetch and cache the JWKS from the provider using httpx.
+
+    We fetch manually instead of using PyJWKClient because the latter
+    uses urllib internally, whose default User-Agent gets blocked by
+    some reverse proxies (NPM) and identity providers.
+    """
+    global _jwks_cache, _jwks_ts  # noqa: PLW0603
+
+    now = time.monotonic()
+    if _jwks_cache is not None and (now - _jwks_ts) < _JWKS_TTL:
+        return _jwks_cache
+
     jwks_uri = await get_jwks_uri()
-    _jwk_client = PyJWKClient(jwks_uri, cache_keys=True, lifespan=3600)
-    return _jwk_client
+    async with httpx.AsyncClient(timeout=10) as client:
+        resp = await client.get(
+            jwks_uri,
+            headers={"Accept": "application/json"},
+        )
+        resp.raise_for_status()
+        jwks_data = resp.json()
+
+    _jwks_cache = jwks_data
+    _jwks_ts = now
+    logger.info("oidc.jwks.refreshed uri=%s keys=%d", jwks_uri, len(jwks_data.get("keys", [])))
+    return jwks_data
+
+
+async def _get_signing_key_for_token(raw_token: str) -> Any:
+    """Find the signing key that matches the token's kid header."""
+    jwks_data = await _fetch_jwks()
+
+    # Decode the token header to get the kid
+    unverified_header = pyjwt.get_unverified_header(raw_token)
+    kid = unverified_header.get("kid")
+    alg = unverified_header.get("alg", "RS256")
+
+    for key_data in jwks_data.get("keys", []):
+        if kid and key_data.get("kid") != kid:
+            continue
+        if key_data.get("alg") and key_data["alg"] != alg:
+            continue
+        jwk = PyJWK(key_data, algorithm=alg)
+        return jwk.key
+
+    # If no kid match, try refreshing JWKS (key rotation)
+    global _jwks_cache, _jwks_ts  # noqa: PLW0603
+    _jwks_cache = None
+    _jwks_ts = 0.0
+    jwks_data = await _fetch_jwks()
+
+    for key_data in jwks_data.get("keys", []):
+        if kid and key_data.get("kid") != kid:
+            continue
+        jwk = PyJWK(key_data, algorithm=alg)
+        return jwk.key
+
+    raise pyjwt.PyJWKClientError(f"No matching key found for kid={kid}")
 
 
 # ---------------------------------------------------------------------------
@@ -132,24 +184,36 @@ async def validate_id_token(raw_token: str) -> dict[str, Any]:
     Returns the full set of claims on success.
     Raises ``jwt.PyJWTError`` subclasses on failure.
     """
-    client = await _get_jwk_client()
-    signing_key = client.get_signing_key_from_jwt(raw_token)
+    signing_key = await _get_signing_key_for_token(raw_token)
 
-    claims: dict[str, Any] = pyjwt.decode(
-        raw_token,
-        signing_key.key,
-        algorithms=["RS256", "ES256"],
-        audience=settings.oidc_client_id,
-        issuer=settings.oidc_issuer_url.rstrip("/"),
-        options={
-            "verify_exp": True,
-            "verify_iat": True,
-            "verify_aud": True,
-            "verify_iss": True,
-        },
-        leeway=30,
-    )
-    return claims
+    # Authentik sets the issuer to the base URL (not the application-specific URL)
+    # so we accept both forms.
+    issuer = settings.oidc_issuer_url.rstrip("/")
+    app_issuer = f"{issuer}/application/o/{settings.oidc_application_slug}"
+
+    # Try with the application-specific issuer first, then base issuer
+    for iss in (app_issuer, issuer):
+        try:
+            claims: dict[str, Any] = pyjwt.decode(
+                raw_token,
+                signing_key,
+                algorithms=["RS256", "ES256"],
+                audience=settings.oidc_client_id,
+                issuer=iss,
+                options={
+                    "verify_exp": True,
+                    "verify_iat": True,
+                    "verify_aud": True,
+                    "verify_iss": True,
+                },
+                leeway=30,
+            )
+            return claims
+        except pyjwt.InvalidIssuerError:
+            continue
+
+    # If neither issuer matched, raise with the last error
+    raise pyjwt.InvalidIssuerError("Token issuer does not match expected values")
 
 
 # ---------------------------------------------------------------------------

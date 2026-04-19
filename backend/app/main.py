@@ -24,6 +24,7 @@ from app.api.boards import router as boards_router
 from app.api.gateway import router as gateway_router
 from app.api.gateways import router as gateways_router
 from app.api.metrics import router as metrics_router
+from app.api.oidc_auth import router as oidc_auth_router
 from app.api.organizations import router as organizations_router
 from app.api.skills_marketplace import router as skills_marketplace_router
 from app.api.souls_directory import router as souls_directory_router
@@ -538,6 +539,7 @@ def readyz() -> HealthStatusResponse:
 
 api_v1 = APIRouter(prefix="/api/v1")
 api_v1.include_router(auth_router)
+api_v1.include_router(oidc_auth_router)
 api_v1.include_router(agent_router)
 api_v1.include_router(agents_router)
 api_v1.include_router(activity_router)

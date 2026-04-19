@@ -9,17 +9,28 @@ import {
   getLocalAuthToken,
   isLocalAuthMode,
 } from "@/auth/localAuth";
+import {
+  clearOidcToken,
+  getOidcToken,
+  isOidcAuthMode,
+  redirectToOidcLogin,
+} from "@/auth/oidcAuth";
 import { LocalAuthLogin } from "@/components/organisms/LocalAuthLogin";
 
 export function AuthProvider({ children }: { children: ReactNode }) {
   const localMode = isLocalAuthMode();
+  const oidcMode = isOidcAuthMode();
 
   useEffect(() => {
     if (!localMode) {
       clearLocalAuthToken();
     }
-  }, [localMode]);
+    if (!oidcMode) {
+      clearOidcToken();
+    }
+  }, [localMode, oidcMode]);
 
+  // --- Local auth: show token prompt ---
   if (localMode) {
     if (!getLocalAuthToken()) {
       return <LocalAuthLogin />;
@@ -27,6 +38,17 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     return <>{children}</>;
   }
 
+  // --- OIDC auth: redirect to provider if no session token ---
+  if (oidcMode) {
+    if (!getOidcToken()) {
+      // Not yet authenticated — redirect to OIDC login.
+      // We do this in an effect to avoid hydration mismatches.
+      return <OidcRedirect />;
+    }
+    return <>{children}</>;
+  }
+
+  // --- Clerk auth ---
   const publishableKey = process.env.NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY;
   const afterSignOutUrl =
     process.env.NEXT_PUBLIC_CLERK_AFTER_SIGN_OUT_URL ?? "/";
@@ -42,5 +64,18 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     >
       {children}
     </ClerkProvider>
+  );
+}
+
+/** Minimal component that redirects to the OIDC login endpoint. */
+function OidcRedirect() {
+  useEffect(() => {
+    redirectToOidcLogin();
+  }, []);
+
+  return (
+    <div className="flex min-h-screen items-center justify-center bg-app">
+      <p className="text-sm text-muted">Redirecting to sign in…</p>
+    </div>
   );
 }

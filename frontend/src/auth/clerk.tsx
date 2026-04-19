@@ -17,15 +17,21 @@ import {
 
 import { isLikelyValidClerkPublishableKey } from "@/auth/clerkKey";
 import { getLocalAuthToken, isLocalAuthMode } from "@/auth/localAuth";
+import { getOidcToken, isOidcAuthMode } from "@/auth/oidcAuth";
 
 function hasLocalAuthToken(): boolean {
   return Boolean(getLocalAuthToken());
+}
+
+function hasOidcToken(): boolean {
+  return Boolean(getOidcToken());
 }
 
 export function isClerkEnabled(): boolean {
   // IMPORTANT: keep this in sync with AuthProvider; otherwise components like
   // <SignedOut/> may render without a <ClerkProvider/> and crash during prerender.
   if (isLocalAuthMode()) return false;
+  if (isOidcAuthMode()) return false;
   return isLikelyValidClerkPublishableKey(
     process.env.NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY,
   );
@@ -35,6 +41,9 @@ export function SignedIn(props: { children: ReactNode }) {
   if (isLocalAuthMode()) {
     return hasLocalAuthToken() ? <>{props.children}</> : null;
   }
+  if (isOidcAuthMode()) {
+    return hasOidcToken() ? <>{props.children}</> : null;
+  }
   if (!isClerkEnabled()) return null;
   return <ClerkSignedIn>{props.children}</ClerkSignedIn>;
 }
@@ -42,6 +51,9 @@ export function SignedIn(props: { children: ReactNode }) {
 export function SignedOut(props: { children: ReactNode }) {
   if (isLocalAuthMode()) {
     return hasLocalAuthToken() ? null : <>{props.children}</>;
+  }
+  if (isOidcAuthMode()) {
+    return hasOidcToken() ? null : <>{props.children}</>;
   }
   if (!isClerkEnabled()) return <>{props.children}</>;
   return <ClerkSignedOut>{props.children}</ClerkSignedOut>;
@@ -68,6 +80,13 @@ export function useUser() {
       user: null,
     } as const;
   }
+  if (isOidcAuthMode()) {
+    return {
+      isLoaded: true,
+      isSignedIn: hasOidcToken(),
+      user: null,
+    } as const;
+  }
   if (!isClerkEnabled()) {
     return { isLoaded: true, isSignedIn: false, user: null } as const;
   }
@@ -82,6 +101,16 @@ export function useAuth() {
       isSignedIn: Boolean(token),
       userId: token ? "local-user" : null,
       sessionId: token ? "local-session" : null,
+      getToken: async () => token,
+    } as const;
+  }
+  if (isOidcAuthMode()) {
+    const token = getOidcToken();
+    return {
+      isLoaded: true,
+      isSignedIn: Boolean(token),
+      userId: token ? "oidc-user" : null,
+      sessionId: token ? "oidc-session" : null,
       getToken: async () => token,
     } as const;
   }

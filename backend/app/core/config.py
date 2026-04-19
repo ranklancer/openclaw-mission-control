@@ -39,7 +39,8 @@ class Settings(BaseSettings):
     environment: str = "dev"
     database_url: str = "postgresql+psycopg://postgres:postgres@localhost:5432/openclaw_agency"
 
-    # Auth mode: "clerk" for Clerk JWT auth, "local" for shared bearer token auth.
+    # Auth mode: "clerk" for Clerk JWT auth, "local" for shared bearer token auth,
+    # "oidc" for generic OIDC provider (e.g. Authentik).
     auth_mode: AuthMode
     local_auth_token: str = ""
 
@@ -48,6 +49,13 @@ class Settings(BaseSettings):
     clerk_api_url: str = "https://api.clerk.com"
     clerk_verify_iat: bool = True
     clerk_leeway: float = 10.0
+
+    # OIDC auth (generic OpenID Connect provider, e.g. Authentik)
+    oidc_issuer_url: str = ""
+    oidc_client_id: str = ""
+    oidc_client_secret: str = ""
+    oidc_application_slug: str = ""
+    oidc_session_secret: str = ""  # HMAC key for backend-issued session JWTs
 
     cors_origins: str = ""
     base_url: str = ""
@@ -107,6 +115,28 @@ class Settings(BaseSettings):
             ):
                 raise ValueError(
                     "LOCAL_AUTH_TOKEN must be at least 50 characters and non-placeholder when AUTH_MODE=local.",
+                )
+        elif self.auth_mode == AuthMode.OIDC:
+            if not self.oidc_issuer_url.strip():
+                raise ValueError(
+                    "OIDC_ISSUER_URL must be set and non-empty when AUTH_MODE=oidc.",
+                )
+            if not self.oidc_client_id.strip():
+                raise ValueError(
+                    "OIDC_CLIENT_ID must be set and non-empty when AUTH_MODE=oidc.",
+                )
+            if not self.oidc_client_secret.strip():
+                raise ValueError(
+                    "OIDC_CLIENT_SECRET must be set and non-empty when AUTH_MODE=oidc.",
+                )
+            if not self.oidc_application_slug.strip():
+                raise ValueError(
+                    "OIDC_APPLICATION_SLUG must be set and non-empty when AUTH_MODE=oidc.",
+                )
+            if not self.oidc_session_secret.strip():
+                raise ValueError(
+                    "OIDC_SESSION_SECRET must be set and non-empty when AUTH_MODE=oidc. "
+                    "Generate with: python -c \"import secrets; print(secrets.token_urlsafe(64))\"",
                 )
 
         base_url = self.base_url.strip()

@@ -1,14 +1,17 @@
-"""User authentication helpers for Clerk and local-token auth modes.
+"""User authentication helpers for Clerk, local-token, and OIDC auth modes.
 
 This module resolves an authenticated *user* from inbound HTTP requests.
 
 Auth modes:
-- `local`: a single shared bearer token (`LOCAL_AUTH_TOKEN`) for self-hosted
+- ``local``: a single shared bearer token (``LOCAL_AUTH_TOKEN``) for self-hosted
   deployments.
-- `clerk`: Clerk JWT authentication for multi-user deployments.
+- ``clerk``: Clerk JWT authentication for multi-user deployments.
+- ``oidc``: Generic OIDC provider (e.g. Authentik).  The backend issues its
+  own session JWTs after a successful Authorization Code exchange; the
+  frontend sends these as ``Authorization: Bearer <token>``.
 
-The public surface area is the `get_auth_context*` dependencies, which return an
-`AuthContext` used across API routers.
+The public surface area is the ``get_auth_context*`` dependencies, which return an
+``AuthContext`` used across API routers.
 
 Notes:
 - This file documents *why* some choices exist (e.g. claim extraction fallbacks)
@@ -66,9 +69,9 @@ class AuthContext:
 
 
 def _extract_bearer_token(authorization: str | None) -> str | None:
-    """Extract the bearer token from an `Authorization` header.
+    """Extract the bearer token from an ``Authorization`` header.
 
-    Returns `None` for missing/empty headers or non-bearer schemes.
+    Returns ``None`` for missing/empty headers or non-bearer schemes.
 
     Note: we do *not* validate the token here; this helper is only responsible for parsing.
     """
@@ -102,9 +105,9 @@ def _extract_claim_email(claims: dict[str, object]) -> str | None:
     """Best-effort extraction of an email address from Clerk/JWT-like claims.
 
     Clerk payloads vary depending on token type and SDK version. We try common flat keys first,
-    then fall back to an `email_addresses` list (either strings or dict-like entries).
+    then fall back to an ``email_addresses`` list (either strings or dict-like entries).
 
-    Returns a normalized lowercase email or `None`.
+    Returns a normalized lowercase email or ``None``.
     """
 
     for key in ("email", "email_address", "primary_email_address"):
@@ -155,14 +158,14 @@ def _extract_claim_name(claims: dict[str, object]) -> str | None:
 
 
 def _extract_clerk_profile(profile: ClerkUser | None) -> tuple[str | None, str | None]:
-    """Extract `(email, name)` from a Clerk user profile.
+    """Extract ``(email, name)`` from a Clerk user profile.
 
     The Clerk SDK surface is not perfectly consistent across environments:
     - some fields may be absent,
     - email addresses may be represented as strings or objects,
-    - the "primary" email may be identified by id.
+    - the \"primary\" email may be identified by id.
 
-    This helper implements a defensive, best-effort extraction strategy and returns `(None, None)`
+    This helper implements a defensive, best-effort extraction strategy and returns ``(None, None)``
     when the profile is unavailable.
     """
 
@@ -447,6 +450,62 @@ async def _resolve_local_auth_context(
     return AuthContext(actor_type="user", user=user)
 
 
+# ---------------------------------------------------------------------------
+# OIDC session-token authentication
+# ---------------------------------------------------------------------------
+
+
+async def _resolve_oidc_auth_context(
+    *,
+    request: Request,
+    session: AsyncSession,
+    required: bool,
+) -> AuthContext | None:
+    """Validate a backend-issued session JWT and resolve the user."""
+    from app.core.oidc import validate_session_token
+
+    token = _extract_bearer_token(request.headers.get("Authorization"))
+    if token is None:
+        if required:
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED)
+        return None
+
+    try:
+        claims = validate_session_token(token)
+    except Exception:
+        if required:
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED)
+        return None
+
+    oidc_sub = claims.get("sub")
+    if not oidc_sub:
+        if required:
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED)
+        return None
+
+    # Look up the user by their OIDC subject (stored in clerk_user_id column).
+    defaults: dict[str, object] = {}
+    email = claims.get("email")
+    name = claims.get("name")
+    if email:
+        defaults["email"] = email
+    if name:
+        defaults["name"] = name
+
+    user, _created = await crud.get_or_create(
+        session,
+        User,
+        clerk_user_id=oidc_sub,
+        defaults=defaults,
+    )
+
+    from app.services.organizations import ensure_member_for_user
+
+    await ensure_member_for_user(session, user)
+
+    return AuthContext(actor_type="user", user=user)
+
+
 def _parse_subject(claims: dict[str, object]) -> str | None:
     payload = ClerkTokenPayload.model_validate(claims)
     return payload.sub
@@ -467,6 +526,16 @@ async def get_auth_context(
         if local_auth is None:  # pragma: no cover
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED)
         return local_auth
+
+    if settings.auth_mode == AuthMode.OIDC:
+        oidc_auth = await _resolve_oidc_auth_context(
+            request=request,
+            session=session,
+            required=True,
+        )
+        if oidc_auth is None:  # pragma: no cover
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED)
+        return oidc_auth
 
     request_state = await _authenticate_clerk_request(request)
     if request_state.status != AuthStatus.SIGNED_IN or not isinstance(request_state.payload, dict):
@@ -499,11 +568,18 @@ async def get_auth_context_optional(
     credentials: HTTPAuthorizationCredentials | None = SECURITY_DEP,
     session: AsyncSession = SESSION_DEP,
 ) -> AuthContext | None:
-    """Resolve user context if available, otherwise return `None`."""
+    """Resolve user context if available, otherwise return ``None``."""
     if request.headers.get("X-Agent-Token"):
         return None
     if settings.auth_mode == AuthMode.LOCAL:
         return await _resolve_local_auth_context(
+            request=request,
+            session=session,
+            required=False,
+        )
+
+    if settings.auth_mode == AuthMode.OIDC:
+        return await _resolve_oidc_auth_context(
             request=request,
             session=session,
             required=False,

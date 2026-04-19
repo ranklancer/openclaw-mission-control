@@ -1,4 +1,5 @@
 import { getLocalAuthToken, isLocalAuthMode } from "@/auth/localAuth";
+import { getOidcToken, isOidcAuthMode } from "@/auth/oidcAuth";
 import { getApiBaseUrl } from "@/lib/api-base";
 
 type ClerkSession = {
@@ -47,8 +48,16 @@ export const customFetch = async <T>(
   if (hasBody && !headers.has("Content-Type")) {
     headers.set("Content-Type", "application/json");
   }
+
+  // Attach auth token: local → OIDC → Clerk (in priority order)
   if (isLocalAuthMode() && !headers.has("Authorization")) {
     const token = getLocalAuthToken();
+    if (token) {
+      headers.set("Authorization", `Bearer ${token}`);
+    }
+  }
+  if (isOidcAuthMode() && !headers.has("Authorization")) {
+    const token = getOidcToken();
     if (token) {
       headers.set("Authorization", `Bearer ${token}`);
     }
@@ -64,6 +73,17 @@ export const customFetch = async <T>(
     ...options,
     headers,
   });
+
+  // If we get a 401 in OIDC mode, clear the stale token and redirect to login.
+  if (response.status === 401 && isOidcAuthMode()) {
+    const { clearOidcToken, redirectToOidcLogin } = await import(
+      "@/auth/oidcAuth"
+    );
+    clearOidcToken();
+    redirectToOidcLogin();
+    // Return a rejected promise so callers don't proceed.
+    throw new ApiError(401, "Session expired — redirecting to sign in.", null);
+  }
 
   if (!response.ok) {
     const contentType = response.headers.get("content-type") ?? "";

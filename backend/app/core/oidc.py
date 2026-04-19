@@ -55,7 +55,7 @@ async def _fetch_discovery() -> dict[str, Any]:
 
     _discovery_cache = doc
     _discovery_ts = now
-    logger.info("oidc.discovery.refreshed issuer=%s", issuer)
+    logger.info("oidc.discovery.refreshed issuer=%s doc_issuer=%s", issuer, doc.get("issuer", "?"))
     return doc
 
 
@@ -77,6 +77,12 @@ async def get_jwks_uri() -> str:
 async def get_userinfo_endpoint() -> str:
     doc = await _fetch_discovery()
     return str(doc["userinfo_endpoint"])
+
+
+async def get_discovery_issuer() -> str:
+    """Return the issuer from the discovery document (the authoritative value)."""
+    doc = await _fetch_discovery()
+    return str(doc.get("issuer", settings.oidc_issuer_url.rstrip("/")))
 
 
 # ---------------------------------------------------------------------------
@@ -186,13 +192,31 @@ async def validate_id_token(raw_token: str) -> dict[str, Any]:
     """
     signing_key = await _get_signing_key_for_token(raw_token)
 
-    # Authentik sets the issuer to the base URL (not the application-specific URL)
-    # so we accept both forms.
-    issuer = settings.oidc_issuer_url.rstrip("/")
-    app_issuer = f"{issuer}/application/o/{settings.oidc_application_slug}"
+    # Build a set of acceptable issuers.
+    # Authentik may use the base URL, the application-specific URL, or
+    # the discovery document's issuer — with or without trailing slashes.
+    issuer_base = settings.oidc_issuer_url.rstrip("/")
+    app_issuer = f"{issuer_base}/application/o/{settings.oidc_application_slug}"
+    discovery_issuer = await get_discovery_issuer()
 
-    # Try with the application-specific issuer first, then base issuer
-    for iss in (app_issuer, issuer):
+    # Deduplicate and include trailing-slash variants
+    candidate_issuers: set[str] = set()
+    for iss in (issuer_base, app_issuer, discovery_issuer):
+        candidate_issuers.add(iss.rstrip("/"))
+        candidate_issuers.add(iss.rstrip("/") + "/")
+
+    # Log for debugging
+    unverified = pyjwt.decode(raw_token, options={"verify_signature": False})
+    token_issuer = unverified.get("iss", "unknown")
+    logger.info(
+        "oidc.validate_id_token token_issuer=%s candidates=%s",
+        token_issuer,
+        sorted(candidate_issuers),
+    )
+
+    # Try each candidate issuer
+    last_error: Exception | None = None
+    for iss in sorted(candidate_issuers):
         try:
             claims: dict[str, Any] = pyjwt.decode(
                 raw_token,
@@ -209,11 +233,14 @@ async def validate_id_token(raw_token: str) -> dict[str, Any]:
                 leeway=30,
             )
             return claims
-        except pyjwt.InvalidIssuerError:
+        except pyjwt.InvalidIssuerError as exc:
+            last_error = exc
             continue
 
-    # If neither issuer matched, raise with the last error
-    raise pyjwt.InvalidIssuerError("Token issuer does not match expected values")
+    # None matched — raise with useful context
+    raise pyjwt.InvalidIssuerError(
+        f"Token issuer '{token_issuer}' does not match any expected value: {sorted(candidate_issuers)}"
+    ) from last_error
 
 
 # ---------------------------------------------------------------------------

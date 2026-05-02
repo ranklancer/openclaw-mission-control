@@ -857,7 +857,11 @@ class BaseAgentLifecycleManager(ABC):
                     content=content,
                 )
             except OpenClawGatewayError as exc:
-                if "unsupported file" in str(exc).lower():
+                exc_msg = str(exc).lower()
+                # Gateway may reject certain filenames as "unsupported file" (older
+                # versions) or "unsafe workspace file" (2026.4.29+).  Both mean the
+                # gateway's security policy forbids this filename — skip gracefully.
+                if "unsupported file" in exc_msg or "unsafe workspace file" in exc_msg:
                     unsupported_names.append(name)
                     continue
                 raise

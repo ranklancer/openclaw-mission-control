@@ -839,6 +839,7 @@ class BaseAgentLifecycleManager(ABC):
         )
         target_file_names = desired_file_names or set(rendered.keys())
         unsupported_names: list[str] = []
+        security_blocked_names: list[str] = []
 
         for name, content in rendered.items():
             if content == "":
@@ -858,13 +859,27 @@ class BaseAgentLifecycleManager(ABC):
                 )
             except OpenClawGatewayError as exc:
                 exc_msg = str(exc).lower()
-                # Gateway may reject certain filenames as "unsupported file" (older
-                # versions) or "unsafe workspace file" (2026.4.29+).  Both mean the
-                # gateway's security policy forbids this filename — skip gracefully.
-                if "unsupported file" in exc_msg or "unsafe workspace file" in exc_msg:
+                # "unsafe workspace file" (2026.4.29+) = gateway security policy
+                # blocking a specific filename.  These are expected and should not
+                # prevent provisioning — the agent operates without them.
+                if "unsafe workspace file" in exc_msg:
+                    security_blocked_names.append(name)
+                    continue
+                # "unsupported file" (older gateways) = the gateway has no handler
+                # for this file type at all — a capability gap.
+                if "unsupported file" in exc_msg:
                     unsupported_names.append(name)
                     continue
                 raise
+
+        if security_blocked_names:
+            blocked_sorted = ", ".join(sorted(set(security_blocked_names)))
+            logger.warning(
+                "Gateway security policy blocked workspace files for agent %s: %s "
+                "(provisioning continues without them)",
+                agent_id,
+                blocked_sorted,
+            )
 
         if agent is not None and agent.is_board_lead and unsupported_names:
             unsupported_sorted = ", ".join(sorted(set(unsupported_names)))
